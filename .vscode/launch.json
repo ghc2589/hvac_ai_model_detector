@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug HVAC Server",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/Deploy/build/hvac",
+            "args": [],
+            "cwd": "${workspaceFolder}/Deploy",
+            "preLaunchTask": "Build HVAC Server Debug",
+            "internalConsoleOptions": "openOnSessionStart",
+            "MIMode":"lldb"
+        }
+    ]
+}
