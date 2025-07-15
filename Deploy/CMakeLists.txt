@@ -19,7 +19,7 @@ find_package(Crow REQUIRED)
 find_package(RapidJSON REQUIRED)
 find_package(onnxruntime REQUIRED CONFIG)
 find_package(OpenCV REQUIRED)
-find_package(llama-cpp REQUIRED CONFIG)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -mtune=native")
 
 target_include_directories(hvac PRIVATE ${rapidjson_INCLUDE_DIRS})
 target_link_libraries(hvac PRIVATE
@@ -27,6 +27,4 @@ target_link_libraries(hvac PRIVATE
         rapidjson
         onnxruntime::onnxruntime
         opencv::opencv
-        llama-cpp::llama
-        llama-cpp::common
 )

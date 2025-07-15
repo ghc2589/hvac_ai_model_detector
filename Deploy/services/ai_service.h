@@ -4,12 +4,13 @@
 #include <opencv2/opencv.hpp>
 #include <memory>
 #include <vector>
-#include <string>
+#include <string> // Ensure this header is included for std::string
 #include <set>
 #include <unordered_map>
 #include <rapidjson/document.h>
 #include "../models/hvac_model.h"
 #include "../services/phi3_service.h"
+#include <optional>
 
 struct TextBox {
     std::vector<cv::Point2f> corners;
@@ -104,11 +105,24 @@ private:
     // PaddleOCR ONNX models
     std::unique_ptr<Ort::Session> det_session_;
     std::unique_ptr<Ort::Session> rec_session_;
-    // PHI3Service (llama-cpp)
-    std::unique_ptr<PHI3Service> phi3_service_;
+    
     // Model metadata loaded from ONNX
     std::unordered_map<std::string, int> vocab_;
     std::unordered_map<int, std::string> idx2model_;
     rapidjson::Document spec_lookup_;
     rapidjson::Document cleanJson(const std::string& raw) const;
+
+    /// Extrae por regex el resto de campos HVAC (serial_number,
+    /// refrigerant_type, voltage, phase, frequency_hz, etc.)
+    /// para usar como fallback cuando la inferencia ONNX no sea confiable.
+    std::string extractModelCode(const std::string& text);
+    std::unordered_map<std::string, std::string> extractHVACFieldsFromOCR(const std::string& text);
+    std::vector<std::string> recognizeTextBatch(
+        const cv::Mat& image,
+        const std::vector<std::vector<cv::Point2f>>& all_corners
+    );
+    // Nombres de entrada/salida del modelo de reconocimiento OCR
+    std::string rec_input_name_;
+    std::string rec_output_name_;
+
 };

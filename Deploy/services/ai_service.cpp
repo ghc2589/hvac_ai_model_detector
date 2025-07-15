@@ -6,7 +6,9 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <string>
 #include <regex>
+#include <string>
 #include <chrono>
 #include <ctime>
 #include <thread>
@@ -15,41 +17,45 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 #include <opencv2/opencv.hpp>
-#include <llama.h>
 #include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
 #include <stdexcept>
 
 AIService::AIService() {
-    phi3_service_ = nullptr;
 }
 
 AIService::~AIService() = default;
 
-bool AIService::initialize(const std::string& hvac_model_path, const std::string& det_model_path, const std::string& rec_model_path, const std::string& phi3_model_path) {
+bool AIService::initialize(const std::string& hvac_model_path,
+                           const std::string& det_model_path,
+                           const std::string& rec_model_path,
+                           const std::string& phi3_model_path) {
     try {
+        // Crear entorno y opciones de sesión
         ort_env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "HVAC_AI_Service");
         session_options_ = std::make_unique<Ort::SessionOptions>();
-        session_options_->SetIntraOpNumThreads(1);
-        // Create HVAC classification session
+        session_options_->SetIntraOpNumThreads(6);  // mejor rendimiento multithread
+        session_options_->SetExecutionMode(ORT_PARALLEL); // permite paralelismo interno
+        session_options_->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+
+        // Inicializar sesión de clasificación HVAC
         ort_session_ = std::make_unique<Ort::Session>(*ort_env_, hvac_model_path.c_str(), *session_options_);
-        memory_info_ = std::make_unique<Ort::MemoryInfo>(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault));
-        // Initialize PaddleOCR models
+        memory_info_ = std::make_unique<Ort::MemoryInfo>(
+            Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault));
+
+        // Inicializar modelos OCR
         if (!initializePaddleOCRModels(det_model_path, rec_model_path)) {
             std::cerr << "Failed to initialize PaddleOCR models" << std::endl;
             return false;
         }
-        // Initialize PHI3Service (llama-cpp)
-        phi3_service_ = std::make_unique<PHI3Service>();
-        if (!phi3_service_->initializeLlama(phi3_model_path)) {
-            std::cerr << "Failed to initialize PHI3Service (llama-cpp)" << std::endl;
-            return false;
-        }
-        // Load model metadata
+
+        // Cargar vocabulario y metadatos
         if (!loadModelMetadata()) {
             std::cerr << "Failed to load model metadata" << std::endl;
             return false;
         }
+
         std::cout << "AI Service initialized successfully" << std::endl;
         return true;
     } catch (const std::exception& e) {
@@ -57,6 +63,7 @@ bool AIService::initialize(const std::string& hvac_model_path, const std::string
         return false;
     }
 }
+
 
 bool AIService::loadModelMetadata() {
     try {
@@ -88,8 +95,6 @@ bool AIService::loadModelMetadata() {
                 }
                 std::cout << "Loaded idx2model with " << idx2model_.size() << " entries" << std::endl;
             }
-            using namespace std;
-            string model_code = "dime cual"; // Default model code
             
             // Load spec lookup
             auto spec_value = metadata.LookupCustomMetadataMapAllocated("spec_lookup_json", allocator);
@@ -142,7 +147,12 @@ bool AIService::initializePaddleOCRModels(const std::string& det_model_path, con
         // Initialize recognition model
         rec_session_ = std::make_unique<Ort::Session>(*ort_env_, rec_model_path.c_str(), *session_options_);
         std::cout << "Recognition model loaded successfully: " << rec_model_path << std::endl;
-        
+        Ort::AllocatorWithDefaultOptions allocator;
+        auto rec_input_name_ptr = rec_session_->GetInputNameAllocated(0, allocator);
+        auto rec_output_name_ptr = rec_session_->GetOutputNameAllocated(0, allocator);
+
+        rec_input_name_ = rec_input_name_ptr.get();
+        rec_output_name_ = rec_output_name_ptr.get();
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Error initializing PaddleOCR models: " << e.what() << std::endl;
@@ -181,216 +191,407 @@ rapidjson::Document AIService::processImage(const unsigned char* image_data, siz
         return errorDoc;
     }
 }
-std::string AIService::extractTextFromImage(const unsigned char* image_data, size_t data_size) {
-    try {
-        // Create a cv::Mat from the raw image data
-        std::vector<uchar> image_buffer(image_data, image_data + data_size);
-        cv::Mat original_image = cv::imdecode(image_buffer, cv::IMREAD_COLOR);
+std::vector<std::string> AIService::recognizeTextBatch(const cv::Mat& image,
+                                                       const std::vector<std::vector<cv::Point2f>>& all_corners) {
+    std::vector<cv::Mat> processed_crops;
 
-        if (original_image.empty()) {
-            std::cerr << "Failed to decode image data" << std::endl;
-            return "";
+    int target_height = 48;
+    int max_width = 0;
+
+    // 1. Preprocesar todos los crops y calcular ancho máximo
+    for (const auto& corners : all_corners) {
+        cv::Mat crop = straightenTextRegion(image, corners);
+        if (crop.empty() || crop.cols < 5 || crop.rows < 5) {
+            processed_crops.push_back(cv::Mat());  // marcador de crop inválido
+            continue;
         }
 
-        // Detect text boxes first
-        std::vector<TextBox> detected_boxes = detectTextBoxes(original_image);
-        std::cout << "Detected " << detected_boxes.size() << " text boxes" << std::endl;
-        std::cout << "Processing " << detected_boxes.size() << " text boxes in parallel (max 6 at a time)..." << std::endl;
+        int target_width = static_cast<int>(crop.cols * target_height / static_cast<float>(crop.rows));
+        target_width = std::max(target_width, 10);
+        max_width = std::max(max_width, target_width);
 
-        // Step 1: Recognize text in each detected box using limited parallelism
-        const size_t MAX_CONCURRENCY = 10;
-        std::vector<std::future<std::pair<int, std::string>>> recognition_futures;
-        std::string combined_text = "";
+        // Preprocesamiento
+        cv::Mat resized;
+        cv::resize(crop, resized, cv::Size(target_width, target_height));
+        processed_crops.push_back(resized);
+    }
 
-        for (size_t i = 0; i < detected_boxes.size(); ++i) {
-            recognition_futures.emplace_back(
-                std::async(std::launch::async, [this, &original_image, &detected_boxes, i]() {
-                    std::string recognized_text = recognizeText(original_image, detected_boxes[i].corners);
-                    return std::make_pair(static_cast<int>(i), recognized_text);
-                })
-            );
+    // 2. Crear tensor batch [N, 3, H, W_max]
+    int batch_size = processed_crops.size();
+    int channels = 3;
+    std::vector<int64_t> input_shape = {batch_size, channels, target_height, max_width};
+    std::vector<float> input_tensor_values(batch_size * channels * target_height * max_width, 0.0f);  // inicializa con 0 (padding)
 
-            // Esperar cuando llegamos al límite o en la última iteración
-            if (recognition_futures.size() == MAX_CONCURRENCY || i == detected_boxes.size() - 1) {
-                for (auto& future : recognition_futures) {
-                    auto result = future.get();
-                    int box_index = result.first;
-                    const std::string& recognized_text = result.second;
+    for (int b = 0; b < batch_size; ++b) {
+        const cv::Mat& img = processed_crops[b];
+        if (img.empty()) continue;
 
-                    if (!recognized_text.empty()) {
-                        detected_boxes[box_index].text = recognized_text;
-                        combined_text += recognized_text + " ";
-                    }
+        cv::Mat padded;
+        cv::Mat processed = preprocessImageForRecognition(img);
+
+        // Padear si el ancho es menor al máximo
+        if (processed.cols < max_width) {
+            int pad = max_width - processed.cols;
+            cv::copyMakeBorder(processed, padded, 0, 0, 0, pad, cv::BORDER_CONSTANT, cv::Scalar(0));
+        } else {
+            padded = processed;
+        }
+
+        for (int c = 0; c < channels; ++c) {
+            for (int h = 0; h < target_height; ++h) {
+                for (int w = 0; w < max_width; ++w) {
+                    input_tensor_values[b * channels * target_height * max_width +
+                                        c * target_height * max_width +
+                                        h * max_width + w] = padded.at<cv::Vec3f>(h, w)[c];
                 }
-                recognition_futures.clear();
             }
         }
-
-        // Step 2: Apply histogram equalization to original image for better visualization
-        cv::Mat equalized_original;
-        if (original_image.channels() == 3) {
-            cv::Mat yuv;
-            cv::cvtColor(original_image, yuv, cv::COLOR_BGR2YUV);
-            std::vector<cv::Mat> yuv_channels;
-            cv::split(yuv, yuv_channels);
-            cv::equalizeHist(yuv_channels[0], yuv_channels[0]); // Equalize Y (luminance) channel
-            cv::merge(yuv_channels, yuv);
-            cv::cvtColor(yuv, equalized_original, cv::COLOR_YUV2BGR);
-        } else {
-            cv::equalizeHist(original_image, equalized_original);
-        }
-
-        // Save equalized original for debugging
-        std::string equalized_original_filename = "debug_equalized_original.png";
-        cv::imwrite(equalized_original_filename, equalized_original);
-
-        // Visualize detected boxes on equalized image and save debug image
-        std::string debug_filename = "debug_detected_boxes.png";
-        visualizeTextBoxes(equalized_original, detected_boxes, debug_filename);
-
-        // Step 3: Extract structured data from detected boxes
-        std::string structured_text = extractSortedByXYCoordinatesData(detected_boxes, original_image.cols, original_image.rows);
-        std::cout << "==== TEXTO ORDENADO POR POSICIÓN ====" << std::endl;
-        std::cout << structured_text << std::endl;
-
-        // Clean up combined text
-        if (!combined_text.empty()) {
-            combined_text.pop_back(); // Remove trailing space
-        }
-
-        std::cout << "Combined OCR text: '" << combined_text << "'" << std::endl;
-        std::cout << "Structured data extracted: " << structured_text.size() << " fields" << std::endl;
-
-        return combined_text;
-
-    } catch (const cv::Exception& e) {
-        std::cerr << "OpenCV error during image processing: " << e.what() << std::endl;
-        return "";
-    } catch (const std::exception& e) {
-        std::cerr << "Error during OCR processing: " << e.what() << std::endl;
-        return "";
     }
+
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+        *memory_info_,
+        input_tensor_values.data(),
+        input_tensor_values.size(),
+        input_shape.data(),
+        input_shape.size()
+    );
+
+    const char* input_names[] = {rec_input_name_.c_str()};
+    const char* output_names[] = {rec_output_name_.c_str()};
+
+    auto output_tensors = rec_session_->Run(Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, 1);
+
+    float* output_data = output_tensors[0].GetTensorMutableData<float>();
+    auto output_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
+
+    // Paso final: decodificar cada resultado a texto
+    std::vector<std::string> results;
+    int time_steps = static_cast<int>(output_shape[1]);
+    int num_classes = static_cast<int>(output_shape[2]);
+
+    for (int b = 0; b < batch_size; ++b) {
+        float* single_data = output_data + b * time_steps * num_classes;
+        std::vector<int64_t> shape = {1, time_steps, num_classes};
+        std::string decoded = decodeRecognitionOutput(single_data, shape);
+        results.push_back(decoded);
+    }
+
+    return results;
 }
 
 
-/* =========================================================================
-   AIService::extractTextAndStructuredData  –  FULL schema, no id/sim/conf
-   ========================================================================= */
 rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char* image_data,
-                                        size_t data_size)
-{
+                                                            size_t data_size) {
     std::unordered_map<std::string, std::string> out_map;
 
     try {
         auto t0 = std::chrono::high_resolution_clock::now();
-        /* ---------- 1. Decode image ---------- */
+
+        // 1. Decodificar imagen
         std::vector<uchar> image_buffer(image_data, image_data + data_size);
         cv::Mat img = cv::imdecode(image_buffer, cv::IMREAD_COLOR);
         if (img.empty()) {
-            std::cerr << "Failed to decode image\n";
             rapidjson::Document errorDoc;
             errorDoc.SetObject();
             errorDoc.AddMember("status", "error", errorDoc.GetAllocator());
             errorDoc.AddMember("error", "Failed to decode image", errorDoc.GetAllocator());
             return errorDoc;
         }
+
         auto t1 = std::chrono::high_resolution_clock::now();
         double preprocess_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::cout << "[TIMER] Preprocesamiento: " << preprocess_ms << " ms" << std::endl;
 
-        /* ---------- 2. OCR pipeline ---------- */
+        // 2. OCR pipeline
         auto t2 = std::chrono::high_resolution_clock::now();
         auto boxes = detectTextBoxes(img);
         auto t3 = std::chrono::high_resolution_clock::now();
         double detection_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
         std::cout << "[TIMER] Detección OCR: " << detection_ms << " ms" << std::endl;
 
-        std::vector<std::future<void>> futs;
+// === RECONOCIMIENTO OCR (batch paralelizado) ===
         auto t4 = std::chrono::high_resolution_clock::now();
-        for (size_t i = 0; i < boxes.size(); ++i) {
-            futs.emplace_back(std::async(std::launch::async, [&, i]{
-                boxes[i].text = recognizeText(img, boxes[i].corners);
+
+        std::vector<std::vector<cv::Point2f>> all_corners;
+        all_corners.reserve(boxes.size());
+        for (const auto& box : boxes) {
+            all_corners.push_back(box.corners);
+        }
+
+        std::vector<std::future<std::vector<std::string>>> futures;
+        int batch_size = all_corners.size();
+        int num_threads = std::thread::hardware_concurrency();  // auto-ajustable
+        num_threads = std::min(num_threads, 8);  // evita oversaturar
+        int step = (batch_size + num_threads - 1) / num_threads;
+
+        for (int i = 0; i < batch_size; i += step) {
+            int end = std::min(i + step, batch_size);
+            futures.emplace_back(std::async(std::launch::async, [&, i, end]() {
+                std::vector<std::vector<cv::Point2f>> sub_corners(all_corners.begin() + i, all_corners.begin() + end);
+                return recognizeTextBatch(img, sub_corners);
             }));
         }
-        for (auto& f : futs) f.get();
+
+        std::vector<std::string> all_texts;
+        for (auto& fut : futures) {
+            auto part = fut.get();
+            all_texts.insert(all_texts.end(), part.begin(), part.end());
+        }
+
+        for (size_t i = 0; i < boxes.size(); ++i) {
+            boxes[i].text = all_texts[i];
+        }
+
         auto t5 = std::chrono::high_resolution_clock::now();
         double recognition_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
-        std::cout << "[TIMER] Reconocimiento OCR: " << recognition_ms << " ms" << std::endl;
+        std::cout << "[TIMER] Reconocimiento OCR (batch paralelo): " << recognition_ms << " ms" << std::endl;
 
-        // Usa tu propio ordenador de texto; aquí llamo al existente
-        std::string ocr_text =
-            extractSortedByXYCoordinatesData(boxes, img.cols, img.rows);
-const std::string prompt = R"PROMPT(
-You are a JSON-only extractor.  
-Your task is to extract relevant values from the provided OCR text and organize them into the JSON schema below.
 
-For each field, locate the corresponding value in the OCR text by looking for labels or units that match the fields meaning. **Do not guess or infer values** that are not explicitly in the text. If a value is not found or is unclear, use `null` for that field.
-**SCHEMA (output JSON structure and types):** *(Maintain this exact field order in the output)*  
-DO NOT include any additional text, explanations, or comments outside the JSON structure. The output must be a valid JSON object with the specified fields and types.
-ONlY use key-value pairs in the JSON output, without any additional text or comments.
-{
-  "brand":                    string|null,    // e.g. "YORK", "Samsung", "Carrier", etc.
-  "model_code":               string|null,
-  "serial_number":           string|null,
-  "refrigerant_type":         string|null,
-  "factory_charge_lb":        string|null,    // refrigerant factory charge (in pounds)
-  "refrigerant_charge_lb":    string|null,    // additional refrigerant charge if any
-  "voltage":                  string|null,    // e.g. "208-230" or "460"
-  "phase":                    int|null,       // 1 or 3 (electrical phase)
-  "frequency_hz":             int|null,       // 50 or 60 (hertz)
-  "rla_a":                    string|null,    // Rated Load Amps (may include unit "A" or multiple values)
-  "fla_a":                    string|null,    // Full Load Amps (for motors, etc.)
-  "high_side_psi":            string|null,    // High-side pressure (psi)
-  "low_side_psi":             string|null,    // Low-side pressure (psi)
-  "test_pressure_psi":        string|null,    // Test pressure (psi)
-  "heating_input_btu":        int|null,       // e.g. 90000 (BTU input for heating)
-  "heating_output_btu":       int|null,       // e.g. 72000 (BTU output for heating)
-  "heating_efficiency_pct":   string|null,    // e.g. "80%" (heating efficiency percentage)
-  "gas_type":                 string|null,    // e.g. "Natural Gas", "Propane"
-  "gas_supply_min_inwc":      string|null,    // min gas supply pressure (in. w.c.)
-  "gas_supply_max_inwc":      string|null,    // max gas supply pressure (in. w.c.)
-  "manifold_pressure_inwc":   string|null,    // manifold pressure (in. w.c.)
-  "gas_input_min_btu":        int|null,       // minimum gas input (BTU) if a range is given
-  "gas_input_max_btu":        int|null,       // maximum gas input (BTU)
-  "gas_output_cap_btu":       int|null,       // gas output capacity (BTU)
-  "gas_supply_inwc":          string|null,    // gas supply pressure (in. w.c.) if only one value given (else use min/max)
-  "air_temp_rise_f":          string|null,    // temperature rise in °F (range or single value)
-  "max_ext_static_inwc":      string|null,    // maximum external static pressure (in. w.c.)
-  "cooling_capacity_btu":     int|null,       // e.g. 24000 (cooling capacity in BTU)
-  "ieer":                     string|null,    // Integrated Energy Efficiency Ratio (e.g. "15.4")
-  "eer":                      string|null,    // Energy Efficiency Ratio (e.g. "12.0")
-  "compressor_quantity":      int|null,       // number of compressors (e.g. 1 or 2)
-  "compressor_type":          string|null,    // e.g. "Scroll", "Reciprocating"
-  "compressor_hz":            string|null,    // compressor frequency if applicable, e.g. "50Hz" (often null if not stated)
-  "min_ambient_f":            string|null,    // minimum ambient operating temp (°F)
-  "max_ambient_f":            string|null,    // maximum ambient operating temp (°F)
-  "max_air_temp_f":           string|null,    // maximum air temperature (°F) 
-  "installation_type":        string|null     // e.g. "outdoor", "indoor", "rooftop"
-}
 
-<OCR>
-)PROMPT" + ocr_text + R"PROMPT(
-</OCR>
-)PROMPT";
+        // 3. Extraer texto estructurado
+        std::string ocr_text = extractSortedByXYCoordinatesData(boxes, img.cols, img.rows);
+        std::cout << "ocr text: " << ocr_text << std::endl;
 
-        /* ---------- 4. Phi-3 inference ---------- */
-        auto t6 = std::chrono::high_resolution_clock::now();
-        std::string raw = phi3_service_->infer(prompt);
-        auto t7 = std::chrono::high_resolution_clock::now();
-        double llm_ms = std::chrono::duration<double, std::milli>(t7 - t6).count();
-        std::cout << "[TIMER] Inferencia LLM: " << llm_ms << " ms" << std::endl;
+        // 4. Crear JSON de salida
+        rapidjson::Document json;
+        json.SetObject();
+        rapidjson::Document::AllocatorType& allocator = json.GetAllocator();
 
-        rapidjson::Document json = cleanJson(raw);          // helper below
+        std::vector<std::string> schema_fields = {
+            "brand", "model_code", "serial_number", "refrigerant_type", "factory_charge_lb", "refrigerant_charge_lb",
+            "voltage", "phase", "frequency_hz", "rla_a", "fla_a", "high_side_psi", "low_side_psi", "test_pressure_psi",
+            "heating_input_btu", "heating_output_btu", "heating_efficiency_pct", "gas_type", "gas_supply_min_inwc",
+            "gas_supply_max_inwc", "manifold_pressure_inwc", "gas_input_min_btu", "gas_input_max_btu", "gas_output_cap_btu",
+            "gas_supply_inwc", "air_temp_rise_f", "max_ext_static_inwc", "cooling_capacity_btu", "ieer", "eer",
+            "compressor_quantity", "compressor_type", "compressor_hz", "min_ambient_f", "max_ambient_f", "max_air_temp_f",
+            "installation_type"
+        };
 
-        /* ---------- 6. Copy every key as string ---------- */
+        // Inicializa todos los campos como null
+        for (const auto& field : schema_fields) {
+            json.AddMember(rapidjson::Value(field.c_str(), allocator), rapidjson::Value().SetNull(), allocator);
+        }
+
+        std::string model_code = extractModelCode(ocr_text);
+        if (!model_code.empty()) {
+            json["model_code"].SetString(model_code.c_str(), allocator);
+        }
+
+        std::cout << "Model code extracted: " << model_code << std::endl;
+        // 5. Inferencia ONNX si hay model_code
+        if (!model_code.empty()) {
+            std::vector<int64_t> input_vec = encodeText(model_code);
+            std::vector<int64_t> input_shape{1, static_cast<int64_t>(input_vec.size())};
+            Ort::Value input_tensor = Ort::Value::CreateTensor<int64_t>(
+                *memory_info_, input_vec.data(), input_vec.size(), input_shape.data(), input_shape.size());
+            const char* input_names[] = {"input"};
+            const char* output_names[] = {"logits"};
+
+            auto output_tensors = ort_session_->Run(
+                Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, 1);
+            float* logits = output_tensors[0].GetTensorMutableData<float>();
+            auto output_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
+            int num_classes = static_cast<int>(output_shape[1]);
+
+            // Softmax
+            std::vector<float> probs(num_classes);
+            float max_logit = logits[0];
+            for (int i = 1; i < num_classes; ++i) max_logit = std::max(max_logit, logits[i]);
+            float sum = 0.0f;
+            for (int i = 0; i < num_classes; ++i) {
+                probs[i] = std::exp(logits[i] - max_logit);
+                sum += probs[i];
+            }
+            for (int i = 0; i < num_classes; ++i) probs[i] /= sum;
+
+            // Top-K
+            int TOP_K = 10;
+            std::vector<int> top_indices(num_classes);
+            std::iota(top_indices.begin(), top_indices.end(), 0);
+            std::sort(top_indices.begin(), top_indices.end(), [&](int a, int b) {
+                return probs[a] > probs[b];
+            });
+
+            float best_sim = 0.0f;
+            int best_idx = -1;
+            std::string norm = normalizeText(model_code);
+            for (int k = 0; k < std::min(TOP_K, num_classes); ++k) {
+                int idx = top_indices[k];
+                std::string cand = idx2model_[idx];
+                float sim = static_cast<float>(calculateSimilarity(cand, norm));
+                if (sim > best_sim) {
+                    best_sim = sim;
+                    best_idx = idx;
+                }
+            }
+
+            float SIM_TH = 0.75f;
+            float PROB_TH = 0.5f;
+            float p_hat = (best_idx >= 0) ? probs[best_idx] : 0.0f;
+
+            if (best_sim < SIM_TH || p_hat < PROB_TH) {
+                json.AddMember("status", "low_confidence", allocator);
+                json.AddMember("similarity", best_sim, allocator);
+                json.AddMember("confidence", p_hat, allocator);
+
+                auto extracted = extractHVACFieldsFromOCR(ocr_text);
+                for (const auto& field : schema_fields) {
+                    if (extracted.count(field)) {
+                        json[field.c_str()].SetString(extracted[field].c_str(), allocator);
+                    }
+                }
+            } else {
+                if (spec_lookup_.IsObject() && spec_lookup_.HasMember(idx2model_[best_idx].c_str())) {
+                    const rapidjson::Value& spec = spec_lookup_[idx2model_[best_idx].c_str()];
+                    for (auto it = spec.MemberBegin(); it != spec.MemberEnd(); ++it) {
+                        rapidjson::Value key(it->name, allocator);
+                        rapidjson::Value val(it->value, allocator);
+                        json.AddMember(key, val, allocator);
+                    }
+                }
+                json.AddMember("similarity", best_sim, allocator);
+                json.AddMember("confidence", p_hat, allocator);
+                json.AddMember("status", "ok", allocator);
+            }
+        } else {
+            json.AddMember("status", "no_model_code", allocator);
+            auto extracted = extractHVACFieldsFromOCR(ocr_text);
+            for (const auto& field : schema_fields) {
+                if (extracted.count(field)) {
+                    json[field.c_str()].SetString(extracted[field].c_str(), allocator);
+                }
+            }
+        }
 
         return json;
-    }
-    catch (const std::exception& e) {
+
+    } catch (const std::exception& e) {
         std::cerr << "extractTextAndStructuredData: " << e.what() << '\n';
-        return nullptr;
+        rapidjson::Document errorDoc;
+        errorDoc.SetObject();
+        errorDoc.AddMember("status", "error", errorDoc.GetAllocator());
+        errorDoc.AddMember("error", rapidjson::Value(e.what(), errorDoc.GetAllocator()), errorDoc.GetAllocator());
+        return errorDoc;
     }
 }
+
+std::string AIService::extractModelCode(const std::string& text) {
+    std::smatch match;
+    std::string best_candidate;
+
+    // Paso 1: Buscar "MODEL NAME" con separación
+    std::regex model_tag_rgx(
+        R"((?:MODEL(?:\s*NAME)?)[\s:!\/\-]+([A-Z]{2,}[A-Z0-9\-\/]{4,}))",
+        std::regex::icase
+    );
+    if (std::regex_search(text, match, model_tag_rgx)) {
+        return match.str(1);  // ¡devuélvelo directamente si es confiable y bien separado!
+    }
+
+    // Paso 2: Intentar con modelo pegado ("MODELAM100...")
+    std::regex embedded_rgx(R"(MODEL(?:\s*NAME)?([A-Z]{2,}[A-Z0-9\-\/]{4,}))", std::regex::icase);
+    if (std::regex_search(text, match, embedded_rgx)) {
+        std::string full = match.str(0);
+        std::regex strip_rgx(R"(MODEL(?:\s*NAME)?)", std::regex::icase);
+        return std::regex_replace(full, strip_rgx, "");
+    }
+
+    // Paso 3: Último recurso: buscar candidatos similares
+    std::regex alt_rgx(R"([A-Z]{2,}[A-Z0-9\-\/]{4,})", std::regex::icase);
+    auto words_begin = std::sregex_iterator(text.begin(), text.end(), alt_rgx);
+    auto words_end = std::sregex_iterator();
+
+    size_t max_score = 0;
+    for (auto it = words_begin; it != words_end; ++it) {
+        std::string candidate = it->str();
+        std::string lower = candidate;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+        // Saltar si parece serial number u otros campos
+        if (lower.find("sn") == 0 || lower.find("s/n") == 0 || 
+            lower.find("ipx") == 0 || lower.find("kg") != std::string::npos ||
+            lower.find("made") != std::string::npos) continue;
+
+        bool has_letter = false, has_digit = false;
+        for (char c : candidate) {
+            if (std::isalpha(c)) has_letter = true;
+            if (std::isdigit(c)) has_digit = true;
+        }
+
+        if (has_letter && has_digit && candidate.length() > max_score) {
+            best_candidate = candidate;
+            max_score = candidate.length();
+        }
+    }
+
+    return best_candidate;
+}
+
+
+
+
+std::unordered_map<std::string, std::string> AIService::extractHVACFieldsFromOCR(const std::string& text) {
+    std::unordered_map<std::string, std::string> fields;
+
+    fields["model_code"] = extractModelCode(text);
+
+    std::regex sn_rgx(R"((S[\./]?N[\s:]*([A-Z0-9\-]{6,})))", std::regex::icase);
+    std::smatch sn_match;
+    if (std::regex_search(text, sn_match, sn_rgx)) {
+        fields["serial_number"] = sn_match.str(2);
+    }
+
+    std::regex ref_rgx(R"((R[\- ]?\d{2,3}[A-Z]?))", std::regex::icase);
+    std::smatch ref_match;
+    if (std::regex_search(text, ref_match, ref_rgx)) {
+        fields["refrigerant_type"] = ref_match.str(1);
+    }
+
+    std::regex volt_rgx(R"((\d{3}/\d{3}|\d{3}|\d{2,3})\s*V)", std::regex::icase);
+    std::smatch volt_match;
+    if (std::regex_search(text, volt_match, volt_rgx)) {
+        fields["voltage"] = volt_match.str(0);
+    }
+
+    std::regex phase_rgx(R"((\d)\s*PH)", std::regex::icase);
+    std::smatch phase_match;
+    if (std::regex_search(text, phase_match, phase_rgx)) {
+        fields["phase"] = phase_match.str(1);
+    }
+
+    std::regex freq_rgx(R"((\d{2})\s*HZ)", std::regex::icase);
+    std::smatch freq_match;
+    if (std::regex_search(text, freq_match, freq_rgx)) {
+        fields["frequency_hz"] = freq_match.str(1);
+    }
+
+    std::regex charge_rgx(R"((\d{1,2}\.\d)\s*LB)", std::regex::icase);
+    std::smatch charge_match;
+    if (std::regex_search(text, charge_match, charge_rgx)) {
+        fields["factory_charge_lb"] = charge_match.str(1);
+    }
+
+    std::regex rla_rgx(R"((RLA[\s:]*([\d\.]+)\s*A))", std::regex::icase);
+    std::smatch rla_match;
+    if (std::regex_search(text, rla_match, rla_rgx)) {
+        fields["rla_a"] = rla_match.str(2);
+    }
+
+    std::regex fla_rgx(R"((FLA[\s:]*([\d\.]+)\s*A))", std::regex::icase);
+    std::smatch fla_match;
+    if (std::regex_search(text, fla_match, fla_rgx)) {
+        fields["fla_a"] = fla_match.str(2);
+    }
+
+    std::regex brand_rgx(R"((Trane|Carrier|Lennox|York|Rheem|Goodman))", std::regex::icase);
+    std::smatch brand_match;
+    if (std::regex_search(text, brand_match, brand_rgx)) {
+        fields["brand"] = brand_match.str(1);
+    }
+
+    return fields;
+}
+
 
 rapidjson::Document AIService::cleanJson(const std::string& raw) const
 {
@@ -710,7 +911,7 @@ std::vector<TextBox> AIService::detectTextBoxes(const cv::Mat& image) {
             cv::cvtColor(image, yuv, cv::COLOR_BGR2YUV);
             std::vector<cv::Mat> yuv_channels;
             cv::split(yuv, yuv_channels);
-            cv::equalizeHist(yuv_channels[0], yuv_channels[0]); // Equalize Y (luminance) channel
+            // cv::equalizeHist(yuv_channels[0], yuv_channels[0]); // Equalize Y (luminance) channel
             cv::merge(yuv_channels, yuv);
             cv::cvtColor(yuv, equalized_for_viz, cv::COLOR_YUV2BGR);
         } else {
@@ -870,7 +1071,6 @@ cv::Mat AIService::preprocessImageForDetection(const cv::Mat& image) {
     
     processed = resized;
     
-    // Apply histogram equalization to improve contrast before normalization
     cv::Mat equalized;
     if (processed.channels() == 3) {
         // For color images, convert to YUV, equalize Y channel, then convert back
@@ -878,14 +1078,61 @@ cv::Mat AIService::preprocessImageForDetection(const cv::Mat& image) {
         cv::cvtColor(processed, yuv, cv::COLOR_BGR2YUV);
         std::vector<cv::Mat> yuv_channels;
         cv::split(yuv, yuv_channels);
-        cv::equalizeHist(yuv_channels[0], yuv_channels[0]); // Equalize Y (luminance) channel
+            // --- Aquí aplicas CLAHE en el canal Y (luminosidad) ---
+        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(/*clipLimit=*/2.0, /*tileGridSize=*/cv::Size(8,8));
+        clahe->apply(yuv_channels[0], yuv_channels[0]);
         cv::merge(yuv_channels, yuv);
         cv::cvtColor(yuv, equalized, cv::COLOR_YUV2BGR);
     } else {
         // For grayscale images, directly equalize
         cv::equalizeHist(processed, equalized);
     }
-    
+        // 1. Filtro bilateral para suavizar sin perder bordes
+    cv::Mat bilat;
+    cv::bilateralFilter(equalized, bilat, /*d=*/9, /*sigmaColor=*/75, /*sigmaSpace=*/75);
+    // 2. Unsharp mask para realzar bordes del texto
+    cv::Mat gauss, sharp;
+    cv::GaussianBlur(bilat, gauss, cv::Size(0,0), /*sigma=*/3);
+    cv::addWeighted(bilat, 1.5, gauss, -0.5, 0, sharp);
+    // 3. Top-hat para resaltar trazos claros sobre fondo más oscuro
+    cv::Mat tophat;
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(15,15));
+    cv::morphologyEx(sharp, tophat, cv::MORPH_TOPHAT, kernel);
+
+// 4. Corrección gamma (ajusta gamma<1 para aclarar)
+cv::Mat f;
+tophat.convertTo(f, CV_32F, 1.0/255);
+cv::pow(f, /*gamma=*/0.6, f);
+f.convertTo(tophat, CV_8U, 255);
+
+cv::Mat binInput;
+if (tophat.channels() == 3) {
+    // pasa a gris
+    cv::cvtColor(tophat, binInput, cv::COLOR_BGR2GRAY);
+} else {
+    binInput = tophat;  // ya es mono
+}
+// asegura 8-bits
+if (binInput.type() != CV_8UC1) {
+    binInput.convertTo(binInput, CV_8U, 255.0);
+}
+
+// 5. Umbralización adaptativa (ya con CV_8UC1)
+cv::Mat bin;
+cv::adaptiveThreshold(
+    binInput, bin, 255,
+    cv::ADAPTIVE_THRESH_GAUSSIAN_C,
+    cv::THRESH_BINARY_INV,
+    /*blockSize=*/15, /*C=*/2
+);
+
+// 6. Morfología de cierre y apertura para limpiar artefactos
+cv::Mat m;
+cv::morphologyEx(bin, m, cv::MORPH_CLOSE,
+                 cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3,3)));
+cv::morphologyEx(m, m, cv::MORPH_OPEN,
+                 cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3,3)));
+
     // Save equalized image for debugging
     std::string equalized_debug_filename = "debug_equalized_resized.png";
     cv::imwrite(equalized_debug_filename, equalized);
