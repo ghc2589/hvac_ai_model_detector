@@ -909,24 +909,24 @@ std::vector<TextBox> AIService::detectTextBoxes(const cv::Mat& image) {
         std::cout << "Detected " << text_boxes.size() << " text boxes" << std::endl;
         
         // Apply histogram equalization to original image for better visualization
-        cv::Mat equalized_for_viz;
-        if (image.channels() == 3) {
-            // For color images, convert to YUV, equalize Y channel, then convert back
-            cv::Mat yuv;
-            cv::cvtColor(image, yuv, cv::COLOR_BGR2YUV);
-            std::vector<cv::Mat> yuv_channels;
-            cv::split(yuv, yuv_channels);
-            // cv::equalizeHist(yuv_channels[0], yuv_channels[0]); // Equalize Y (luminance) channel
-            cv::merge(yuv_channels, yuv);
-            cv::cvtColor(yuv, equalized_for_viz, cv::COLOR_YUV2BGR);
-        } else {
-            // For grayscale images, directly equalize
-            cv::equalizeHist(image, equalized_for_viz);
-        }
+        // cv::Mat equalized_for_viz;
+        // if (image.channels() == 3) {
+        //     // For color images, convert to YUV, equalize Y channel, then convert back
+        //     cv::Mat yuv;
+        //     cv::cvtColor(image, yuv, cv::COLOR_BGR2YUV);
+        //     std::vector<cv::Mat> yuv_channels;
+        //     cv::split(yuv, yuv_channels);
+        //     // cv::equalizeHist(yuv_channels[0], yuv_channels[0]); // Equalize Y (luminance) channel
+        //     cv::merge(yuv_channels, yuv);
+        //     cv::cvtColor(yuv, equalized_for_viz, cv::COLOR_YUV2BGR);
+        // } else {
+        //     // For grayscale images, directly equalize
+        //     cv::equalizeHist(image, equalized_for_viz);
+        // }
         
-        // Visualize detected boxes on the equalized image
-        std::string debug_filename = "debug_detected_boxes.png";
-        visualizeTextBoxes(equalized_for_viz, text_boxes, debug_filename);
+        // // Visualize detected boxes on the equalized image
+        // std::string debug_filename = "debug_detected_boxes.png";
+        // visualizeTextBoxes(equalized_for_viz, text_boxes, debug_filename);
         
     } catch (const std::exception& e) {
         std::cerr << "Error in text detection: " << e.what() << std::endl;
