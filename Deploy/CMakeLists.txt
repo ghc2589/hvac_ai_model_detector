@@ -19,7 +19,7 @@ find_package(RapidJSON REQUIRED)
 find_package(onnxruntime REQUIRED CONFIG)
 find_package(OpenCV REQUIRED)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -mtune=native")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -mtune=native -ffast-math")
 
 target_include_directories(hvac PRIVATE ${rapidjson_INCLUDE_DIRS})
 target_link_libraries(hvac PRIVATE

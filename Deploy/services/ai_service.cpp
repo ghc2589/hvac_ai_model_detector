@@ -188,112 +188,218 @@ rapidjson::Document AIService::processImage(const unsigned char* image_data, siz
     }
 }
 
+namespace detail {
+    // Thread‑safe, lazy‑instantiated pool (simple)
+    inline std::vector<std::thread>& threadPool() {
+        static std::vector<std::thread> pool;
+        return pool;
+    }
+
+    template<typename F>
+    void parallel_for(size_t N, F&& fn, unsigned max_threads = 8) {
+        unsigned hw = std::thread::hardware_concurrency();
+        unsigned nt = std::min<unsigned>(hw ? hw : 4, max_threads);
+        nt = std::min<unsigned>(nt, N);
+
+        std::vector<std::future<void>> futures;
+        size_t step = (N + nt - 1) / nt;
+        for (size_t t = 0; t < nt; ++t) {
+            size_t start = t * step;
+            size_t end   = std::min(start + step, N);
+            if (start >= end) break;
+            futures.emplace_back(std::async(std::launch::async, [=,&fn]{
+                for (size_t i = start; i < end; ++i) fn(i);
+            }));
+        }
+        for (auto &f: futures) f.get();
+    }
+} // namespace detail
+// ---------------------------------------------------------------------------
+
 std::vector<std::string> AIService::recognizeTextBatch(
-    const cv::Mat& image,
-    const std::vector<std::vector<cv::Point2f>>& all_corners
-) {
-    std::vector<cv::Mat> processed_crops;
+        const cv::Mat& image,
+        const std::vector<std::vector<cv::Point2f>>& all_corners) {
 
-    int target_height = 48;
-    int max_width = 0;
+    const int target_h = 48;
+    const int channels = 3;
+    int batch = static_cast<int>(all_corners.size());
 
-    // 1. Preprocess all crops
-    for (const auto& corners : all_corners) {
-        cv::Mat crop = straightenTextRegion(image, corners);
-        if (crop.empty() || crop.cols < 5 || crop.rows < 5) {
-            processed_crops.push_back(cv::Mat());
-            continue;
-        }
+    std::vector<cv::Mat> crops(batch);
+    std::vector<int> widths(batch, 0);
+    int max_w = 0;
 
-        int target_width = static_cast<int>(crop.cols * target_height / static_cast<float>(crop.rows));
-        target_width = std::max(target_width, 10);
-        max_width = std::max(max_width, target_width);
+    detail::parallel_for(batch, [&](size_t idx){
+        cv::Mat crop = straightenTextRegion(image, all_corners[idx]);
+        if (crop.empty() || crop.cols < 5 || crop.rows < 5) return;
 
-        // Preprocesamiento
+        int tw = std::max(10, static_cast<int>(
+                 std::ceil(crop.cols * target_h / static_cast<float>(crop.rows))));
         cv::Mat resized;
-        cv::resize(crop, resized, cv::Size(target_width, target_height));
-        processed_crops.push_back(resized);
-    }
+        cv::resize(crop, resized, {tw, target_h}, 0, 0, cv::INTER_LINEAR);
+        crops[idx] = preprocessImageForRecognition(resized);  // BGR→float32[0‑1] y CLAHE/gamma dentro
+        widths[idx] = tw;
+    });
 
-    // 2. Create input batch Tensor for recognition
-    int batch_size = processed_crops.size();
-    int channels = 3;
-    std::vector<int64_t> input_shape = {batch_size, channels, target_height, max_width};
-    std::vector<float> input_tensor_values(batch_size * channels * target_height * max_width, 0.0f);  // padding
+    max_w = *std::max_element(widths.begin(), widths.end());
 
-    for (int b = 0; b < batch_size; ++b) {
-        const cv::Mat& img = processed_crops[b];
-        if (img.empty()) continue;
+    std::vector<int64_t> shape = {batch, channels, target_h, max_w};
+    std::vector<float> input(batch * channels * target_h * max_w, 0.f);
 
-        cv::Mat padded;
-        cv::Mat processed = preprocessImageForRecognition(img);
-
-        if (processed.cols < max_width) {
-            int pad = max_width - processed.cols;
-            cv::copyMakeBorder(processed, padded, 0, 0, 0, pad, cv::BORDER_CONSTANT, cv::Scalar(0));
-        } else {
-            padded = processed;
-        }
-
-        for (int c = 0; c < channels; ++c) {
-            for (int h = 0; h < target_height; ++h) {
-                for (int w = 0; w < max_width; ++w) {
-                    input_tensor_values[b * channels * target_height * max_width +
-                                        c * target_height * max_width +
-                                        h * max_width + w] = padded.at<cv::Vec3f>(h, w)[c];
-                }
+    detail::parallel_for(batch, [&](size_t b){
+        if (crops[b].empty()) return;
+        const cv::Mat& img = crops[b];                 // HxWx3, float32, BGR
+        for (int y = 0; y < target_h; ++y) {
+            const cv::Vec3f* row = img.ptr<cv::Vec3f>(y);
+            float* dst = &input[b*channels*target_h*max_w + y*max_w];
+            for (int x = 0; x < img.cols; ++x) {
+                dst[x]                     = row[x][0];               // C0 (B)
+                dst[target_h*max_w + x]    = row[x][1];               // C1 (G)
+                dst[2*target_h*max_w + x]  = row[x][2];               // C2 (R)
             }
         }
+    });
+
+    Ort::Value in_tensor = Ort::Value::CreateTensor<float>(
+        *memory_info_, input.data(), input.size(), shape.data(), shape.size());
+
+    const char* in_name[]  = {rec_input_name_.c_str()};
+    const char* out_name[] = {rec_output_name_.c_str()};
+
+    auto ort_t0 = std::chrono::high_resolution_clock::now();
+    auto out_tensors = rec_session_->Run(Ort::RunOptions{nullptr},
+                                         in_name, &in_tensor, 1,
+                                         out_name, 1);
+    auto ort_t1 = std::chrono::high_resolution_clock::now();
+
+    /* ---------- 3. Decodificar (paralelo) ---------- */
+    float* out = out_tensors[0].GetTensorMutableData<float>();
+    auto out_shape = out_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
+    int T = static_cast<int>(out_shape[1]);
+    int C = static_cast<int>(out_shape[2]);
+
+    std::vector<std::string> texts(batch);
+    detail::parallel_for(batch, [&](size_t b){
+        texts[b] = decodeRecognitionOutput(out + b*T*C, {1, T, C});
+    });
+
+    auto ort_ms = std::chrono::duration<double, std::milli>(ort_t1 - ort_t0).count();
+    std::cout << "[TIMER]   ONNX  inference: " << ort_ms << " ms\n";
+
+    return texts;
+}
+
+std::string AIService::extractModelCode(const std::string& text) {
+    std::smatch match;
+    std::string best_candidate;
+
+    std::regex model_tag_rgx(
+        R"((?:MODEL(?:\s*NAME)?)[\s:!\/\-]+([A-Z]{2,}[A-Z0-9\-\/]{4,}))",
+        std::regex::icase
+    );
+    if (std::regex_search(text, match, model_tag_rgx)) {
+        return match.str(1); 
     }
 
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        *memory_info_,
-        input_tensor_values.data(),
-        input_tensor_values.size(),
-        input_shape.data(),
-        input_shape.size()
-    );
-
-    const char* input_names[] = {rec_input_name_.c_str()};
-    const char* output_names[] = {rec_output_name_.c_str()};
-
-    auto output_tensors = rec_session_->Run(
-        Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, 1
-    );
-
-    float* output_data = output_tensors[0].GetTensorMutableData<float>();
-    auto output_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
-
-    int time_steps = static_cast<int>(output_shape[1]);
-    int num_classes = static_cast<int>(output_shape[2]);
-
-    std::vector<std::string> results(batch_size);
-
-    // === Paralel decoding ===
-    int decode_threads = std::min<int>(std::thread::hardware_concurrency(), std::thread::hardware_concurrency());
-    int step = (batch_size + decode_threads - 1) / decode_threads;
-
-    std::vector<std::future<void>> futures;
-    for (int t = 0; t < decode_threads; ++t) {
-        int start = t * step;
-        int end = std::min(start + step, batch_size);
-        if (start >= end) break;
-
-        futures.emplace_back(std::async(std::launch::async, [&, start, end]() {
-            for (int b = start; b < end; ++b) {
-                float* single_data = output_data + b * time_steps * num_classes;
-                std::vector<int64_t> shape = {1, time_steps, num_classes};
-                results[b] = decodeRecognitionOutput(single_data, shape);
-            }
-        }));
+    std::regex embedded_rgx(R"(MODEL(?:\s*NAME)?([A-Z]{2,}[A-Z0-9\-\/]{4,}))", std::regex::icase);
+    if (std::regex_search(text, match, embedded_rgx)) {
+        std::string full = match.str(0);
+        std::regex strip_rgx(R"(MODEL(?:\s*NAME)?)", std::regex::icase);
+        return std::regex_replace(full, strip_rgx, "");
     }
 
-    for (auto& fut : futures) fut.get();
+    std::regex alt_rgx(R"([A-Z]{2,}[A-Z0-9\-\/]{4,})", std::regex::icase);
+    auto words_begin = std::sregex_iterator(text.begin(), text.end(), alt_rgx);
+    auto words_end = std::sregex_iterator();
 
-    return results;
+    size_t max_score = 0;
+    for (auto it = words_begin; it != words_end; ++it) {
+        std::string candidate = it->str();
+        std::string lower = candidate;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+        if (lower.find("sn") == 0 || lower.find("s/n") == 0 || 
+            lower.find("ipx") == 0 || lower.find("kg") != std::string::npos ||
+            lower.find("made") != std::string::npos) continue;
+
+        bool has_letter = false, has_digit = false;
+        for (char c : candidate) {
+            if (std::isalpha(c)) has_letter = true;
+            if (std::isdigit(c)) has_digit = true;
+        }
+
+        if (has_letter && has_digit && candidate.length() > max_score) {
+            best_candidate = candidate;
+            max_score = candidate.length();
+        }
+    }
+
+    return best_candidate;
 }
 
 
+
+
+std::unordered_map<std::string, std::string> AIService::extractHVACFieldsFromOCR(const std::string& text) {
+    std::unordered_map<std::string, std::string> fields;
+
+    fields["model_code"] = extractModelCode(text);
+
+    std::regex sn_rgx(R"((S[\./]?N[\s:]*([A-Z0-9\-]{6,})))", std::regex::icase);
+    std::smatch sn_match;
+    if (std::regex_search(text, sn_match, sn_rgx)) {
+        fields["serial_number"] = sn_match.str(2);
+    }
+
+    std::regex ref_rgx(R"((R[\- ]?\d{2,3}[A-Z]?))", std::regex::icase);
+    std::smatch ref_match;
+    if (std::regex_search(text, ref_match, ref_rgx)) {
+        fields["refrigerant_type"] = ref_match.str(1);
+    }
+
+    std::regex volt_rgx(R"((\d{3}/\d{3}|\d{3}|\d{2,3})\s*V)", std::regex::icase);
+    std::smatch volt_match;
+    if (std::regex_search(text, volt_match, volt_rgx)) {
+        fields["voltage"] = volt_match.str(0);
+    }
+
+    std::regex phase_rgx(R"((\d)\s*PH)", std::regex::icase);
+    std::smatch phase_match;
+    if (std::regex_search(text, phase_match, phase_rgx)) {
+        fields["phase"] = phase_match.str(1);
+    }
+
+    std::regex freq_rgx(R"((\d{2})\s*HZ)", std::regex::icase);
+    std::smatch freq_match;
+    if (std::regex_search(text, freq_match, freq_rgx)) {
+        fields["frequency_hz"] = freq_match.str(1);
+    }
+
+    std::regex charge_rgx(R"((\d{1,2}\.\d)\s*LB)", std::regex::icase);
+    std::smatch charge_match;
+    if (std::regex_search(text, charge_match, charge_rgx)) {
+        fields["factory_charge_lb"] = charge_match.str(1);
+    }
+
+    std::regex rla_rgx(R"((RLA[\s:]*([\d\.]+)\s*A))", std::regex::icase);
+    std::smatch rla_match;
+    if (std::regex_search(text, rla_match, rla_rgx)) {
+        fields["rla_a"] = rla_match.str(2);
+    }
+
+    std::regex fla_rgx(R"((FLA[\s:]*([\d\.]+)\s*A))", std::regex::icase);
+    std::smatch fla_match;
+    if (std::regex_search(text, fla_match, fla_rgx)) {
+        fields["fla_a"] = fla_match.str(2);
+    }
+
+    std::regex brand_rgx(R"((Trane|Carrier|Lennox|York|Rheem|Goodman))", std::regex::icase);
+    std::smatch brand_match;
+    if (std::regex_search(text, brand_match, brand_rgx)) {
+        fields["brand"] = brand_match.str(1);
+    }
+
+    return fields;
+}
 
 rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char* image_data,
                                                             size_t data_size) {
@@ -483,121 +589,6 @@ rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char*
         return errorDoc;
     }
 }
-
-std::string AIService::extractModelCode(const std::string& text) {
-    std::smatch match;
-    std::string best_candidate;
-
-    std::regex model_tag_rgx(
-        R"((?:MODEL(?:\s*NAME)?)[\s:!\/\-]+([A-Z]{2,}[A-Z0-9\-\/]{4,}))",
-        std::regex::icase
-    );
-    if (std::regex_search(text, match, model_tag_rgx)) {
-        return match.str(1); 
-    }
-
-    std::regex embedded_rgx(R"(MODEL(?:\s*NAME)?([A-Z]{2,}[A-Z0-9\-\/]{4,}))", std::regex::icase);
-    if (std::regex_search(text, match, embedded_rgx)) {
-        std::string full = match.str(0);
-        std::regex strip_rgx(R"(MODEL(?:\s*NAME)?)", std::regex::icase);
-        return std::regex_replace(full, strip_rgx, "");
-    }
-
-    std::regex alt_rgx(R"([A-Z]{2,}[A-Z0-9\-\/]{4,})", std::regex::icase);
-    auto words_begin = std::sregex_iterator(text.begin(), text.end(), alt_rgx);
-    auto words_end = std::sregex_iterator();
-
-    size_t max_score = 0;
-    for (auto it = words_begin; it != words_end; ++it) {
-        std::string candidate = it->str();
-        std::string lower = candidate;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-
-        if (lower.find("sn") == 0 || lower.find("s/n") == 0 || 
-            lower.find("ipx") == 0 || lower.find("kg") != std::string::npos ||
-            lower.find("made") != std::string::npos) continue;
-
-        bool has_letter = false, has_digit = false;
-        for (char c : candidate) {
-            if (std::isalpha(c)) has_letter = true;
-            if (std::isdigit(c)) has_digit = true;
-        }
-
-        if (has_letter && has_digit && candidate.length() > max_score) {
-            best_candidate = candidate;
-            max_score = candidate.length();
-        }
-    }
-
-    return best_candidate;
-}
-
-
-
-
-std::unordered_map<std::string, std::string> AIService::extractHVACFieldsFromOCR(const std::string& text) {
-    std::unordered_map<std::string, std::string> fields;
-
-    fields["model_code"] = extractModelCode(text);
-
-    std::regex sn_rgx(R"((S[\./]?N[\s:]*([A-Z0-9\-]{6,})))", std::regex::icase);
-    std::smatch sn_match;
-    if (std::regex_search(text, sn_match, sn_rgx)) {
-        fields["serial_number"] = sn_match.str(2);
-    }
-
-    std::regex ref_rgx(R"((R[\- ]?\d{2,3}[A-Z]?))", std::regex::icase);
-    std::smatch ref_match;
-    if (std::regex_search(text, ref_match, ref_rgx)) {
-        fields["refrigerant_type"] = ref_match.str(1);
-    }
-
-    std::regex volt_rgx(R"((\d{3}/\d{3}|\d{3}|\d{2,3})\s*V)", std::regex::icase);
-    std::smatch volt_match;
-    if (std::regex_search(text, volt_match, volt_rgx)) {
-        fields["voltage"] = volt_match.str(0);
-    }
-
-    std::regex phase_rgx(R"((\d)\s*PH)", std::regex::icase);
-    std::smatch phase_match;
-    if (std::regex_search(text, phase_match, phase_rgx)) {
-        fields["phase"] = phase_match.str(1);
-    }
-
-    std::regex freq_rgx(R"((\d{2})\s*HZ)", std::regex::icase);
-    std::smatch freq_match;
-    if (std::regex_search(text, freq_match, freq_rgx)) {
-        fields["frequency_hz"] = freq_match.str(1);
-    }
-
-    std::regex charge_rgx(R"((\d{1,2}\.\d)\s*LB)", std::regex::icase);
-    std::smatch charge_match;
-    if (std::regex_search(text, charge_match, charge_rgx)) {
-        fields["factory_charge_lb"] = charge_match.str(1);
-    }
-
-    std::regex rla_rgx(R"((RLA[\s:]*([\d\.]+)\s*A))", std::regex::icase);
-    std::smatch rla_match;
-    if (std::regex_search(text, rla_match, rla_rgx)) {
-        fields["rla_a"] = rla_match.str(2);
-    }
-
-    std::regex fla_rgx(R"((FLA[\s:]*([\d\.]+)\s*A))", std::regex::icase);
-    std::smatch fla_match;
-    if (std::regex_search(text, fla_match, fla_rgx)) {
-        fields["fla_a"] = fla_match.str(2);
-    }
-
-    std::regex brand_rgx(R"((Trane|Carrier|Lennox|York|Rheem|Goodman))", std::regex::icase);
-    std::smatch brand_match;
-    if (std::regex_search(text, brand_match, brand_rgx)) {
-        fields["brand"] = brand_match.str(1);
-    }
-
-    return fields;
-}
-
-
 rapidjson::Document AIService::cleanJson(const std::string& raw) const
 {
     std::size_t first = raw.find('{');
