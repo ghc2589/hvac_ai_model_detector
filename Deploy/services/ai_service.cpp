@@ -315,14 +315,14 @@ rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char*
 
         auto t1 = std::chrono::high_resolution_clock::now();
         double preprocess_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        std::cout << "[TIMER] Preprocesamiento: " << preprocess_ms << " ms" << std::endl;
+        std::cout << "[TIMER] Preprocessing: " << preprocess_ms << " ms" << std::endl;
 
         // 2. OCR pipeline
         auto t2 = std::chrono::high_resolution_clock::now();
         auto boxes = detectTextBoxes(img);
         auto t3 = std::chrono::high_resolution_clock::now();
         double detection_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
-        std::cout << "[TIMER] Detección OCR: " << detection_ms << " ms" << std::endl;
+        std::cout << "[TIMER] OCR Detection: " << detection_ms << " ms" << std::endl;
 
         auto t4 = std::chrono::high_resolution_clock::now();
 
@@ -358,13 +358,13 @@ rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char*
 
         auto t5 = std::chrono::high_resolution_clock::now();
         double recognition_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
-        std::cout << "[TIMER] Reconocimiento OCR (batch paralelo): " << recognition_ms << " ms" << std::endl;
+        std::cout << "[TIMER] OCR Recognition (parallel batch): " << recognition_ms << " ms" << std::endl;
 
 
 
         // Extract sorted data from OCR results
         std::string ocr_text = extractSortedByXYCoordinatesData(boxes, img.cols, img.rows);
-        std::cout << "ocr text: " << ocr_text << std::endl;
+        std::cout << "OCR text: " << ocr_text << std::endl;
 
         // 4. Create Output JSON
         rapidjson::Document json;
@@ -604,7 +604,7 @@ rapidjson::Document AIService::cleanJson(const std::string& raw) const
     if (first == std::string::npos)
         throw std::runtime_error("no '{'");
 
-    // si hay fence ``` al final, cortar antes
+    // if there is a fence ``` at the end, cut before
     std::size_t fence = raw.rfind("```");
     std::size_t last  = (fence == std::string::npos)
                       ? raw.rfind('}')
@@ -615,7 +615,7 @@ rapidjson::Document AIService::cleanJson(const std::string& raw) const
 
     std::string j = raw.substr(first, last - first + 1);
 
-    // quitar tabs / CR si molestan
+    // remove tabs / CR if present
     j.erase(std::remove_if(j.begin(), j.end(),
            [](unsigned char c){ return c == '\t' || c == '\r'; }), j.end());
 
