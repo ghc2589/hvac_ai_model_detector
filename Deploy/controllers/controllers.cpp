@@ -42,16 +42,13 @@ crow::response Controllers::predict(const crow::request& req)
                    .set_header("Content-Type", "application/json");
         }
 
-        // ─── 2. procesar imagen  (devuelve rapidjson::Document) ----------
         rapidjson::Document result =
             ai_service_->processImage(
                 reinterpret_cast<const unsigned char*>(part.body.data()),
                 part.body.size());
 
-        // ─── 3. construir respuesta --------------------------------------
-        //     Copiar el objeto result en nuestro allocator
         rapidjson::Value spec;
-        spec.CopyFrom(result, alloc);             // deep-copy
+        spec.CopyFrom(result, alloc);
         resp.AddMember("specifications", spec, alloc);
 
         rapidjson::StringBuffer buf;

@@ -12,13 +12,13 @@ add_executable(hvac
     controllers/prediction_controller.cpp
     controllers/controller_manager.cpp
     services/ai_service.cpp
-    services/phi3_service.cpp
 )
 
 find_package(Crow REQUIRED)
 find_package(RapidJSON REQUIRED)
 find_package(onnxruntime REQUIRED CONFIG)
 find_package(OpenCV REQUIRED)
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -mtune=native")
 
 target_include_directories(hvac PRIVATE ${rapidjson_INCLUDE_DIRS})

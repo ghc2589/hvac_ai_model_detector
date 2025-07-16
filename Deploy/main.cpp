@@ -6,7 +6,6 @@
 #include <rapidjson/writer.h>
 #include <rapidjson/stringbuffer.h>
 #include "controllers/controller_manager.h"
-#include "services/phi3_service.h"
 
 int main(){
     // Inicializar AI services y controladores

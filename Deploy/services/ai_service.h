@@ -9,7 +9,6 @@
 #include <unordered_map>
 #include <rapidjson/document.h>
 #include "../models/hvac_model.h"
-#include "../services/phi3_service.h"
 #include <optional>
 
 struct TextBox {
@@ -112,16 +111,14 @@ private:
     rapidjson::Document spec_lookup_;
     rapidjson::Document cleanJson(const std::string& raw) const;
 
-    /// Extrae por regex el resto de campos HVAC (serial_number,
-    /// refrigerant_type, voltage, phase, frequency_hz, etc.)
-    /// para usar como fallback cuando la inferencia ONNX no sea confiable.
+
     std::string extractModelCode(const std::string& text);
     std::unordered_map<std::string, std::string> extractHVACFieldsFromOCR(const std::string& text);
     std::vector<std::string> recognizeTextBatch(
         const cv::Mat& image,
         const std::vector<std::vector<cv::Point2f>>& all_corners
     );
-    // Nombres de entrada/salida del modelo de reconocimiento OCR
+
     std::string rec_input_name_;
     std::string rec_output_name_;
 

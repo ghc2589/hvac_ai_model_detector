@@ -3,7 +3,6 @@ crowcpp-crow/1.2.1
 onnxruntime/1.18.1              # CPU build
 rapidjson/cci.20220822
 opencv/4.11.0
-llama-cpp/b4570
 
 [generators]
 CMakeDeps

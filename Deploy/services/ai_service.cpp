@@ -1,5 +1,5 @@
 #include "ai_service.h"
-#include "phi3_service.h"
+
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -31,26 +31,22 @@ bool AIService::initialize(const std::string& hvac_model_path,
                            const std::string& rec_model_path,
                            const std::string& phi3_model_path) {
     try {
-        // Crear entorno y opciones de sesión
         ort_env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "HVAC_AI_Service");
         session_options_ = std::make_unique<Ort::SessionOptions>();
-        session_options_->SetIntraOpNumThreads(6);  // mejor rendimiento multithread
-        session_options_->SetExecutionMode(ORT_PARALLEL); // permite paralelismo interno
+        session_options_->SetIntraOpNumThreads(10);
+        session_options_->SetExecutionMode(ORT_PARALLEL);
         session_options_->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
 
-        // Inicializar sesión de clasificación HVAC
         ort_session_ = std::make_unique<Ort::Session>(*ort_env_, hvac_model_path.c_str(), *session_options_);
         memory_info_ = std::make_unique<Ort::MemoryInfo>(
             Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault));
 
-        // Inicializar modelos OCR
         if (!initializePaddleOCRModels(det_model_path, rec_model_path)) {
             std::cerr << "Failed to initialize PaddleOCR models" << std::endl;
             return false;
         }
 
-        // Cargar vocabulario y metadatos
         if (!loadModelMetadata()) {
             std::cerr << "Failed to load model metadata" << std::endl;
             return false;
@@ -191,18 +187,21 @@ rapidjson::Document AIService::processImage(const unsigned char* image_data, siz
         return errorDoc;
     }
 }
-std::vector<std::string> AIService::recognizeTextBatch(const cv::Mat& image,
-                                                       const std::vector<std::vector<cv::Point2f>>& all_corners) {
+
+std::vector<std::string> AIService::recognizeTextBatch(
+    const cv::Mat& image,
+    const std::vector<std::vector<cv::Point2f>>& all_corners
+) {
     std::vector<cv::Mat> processed_crops;
 
     int target_height = 48;
     int max_width = 0;
 
-    // 1. Preprocesar todos los crops y calcular ancho máximo
+    // 1. Preprocess all crops
     for (const auto& corners : all_corners) {
         cv::Mat crop = straightenTextRegion(image, corners);
         if (crop.empty() || crop.cols < 5 || crop.rows < 5) {
-            processed_crops.push_back(cv::Mat());  // marcador de crop inválido
+            processed_crops.push_back(cv::Mat());
             continue;
         }
 
@@ -216,11 +215,11 @@ std::vector<std::string> AIService::recognizeTextBatch(const cv::Mat& image,
         processed_crops.push_back(resized);
     }
 
-    // 2. Crear tensor batch [N, 3, H, W_max]
+    // 2. Create input batch Tensor for recognition
     int batch_size = processed_crops.size();
     int channels = 3;
     std::vector<int64_t> input_shape = {batch_size, channels, target_height, max_width};
-    std::vector<float> input_tensor_values(batch_size * channels * target_height * max_width, 0.0f);  // inicializa con 0 (padding)
+    std::vector<float> input_tensor_values(batch_size * channels * target_height * max_width, 0.0f);  // padding
 
     for (int b = 0; b < batch_size; ++b) {
         const cv::Mat& img = processed_crops[b];
@@ -229,7 +228,6 @@ std::vector<std::string> AIService::recognizeTextBatch(const cv::Mat& image,
         cv::Mat padded;
         cv::Mat processed = preprocessImageForRecognition(img);
 
-        // Padear si el ancho es menor al máximo
         if (processed.cols < max_width) {
             int pad = max_width - processed.cols;
             cv::copyMakeBorder(processed, padded, 0, 0, 0, pad, cv::BORDER_CONSTANT, cv::Scalar(0));
@@ -259,25 +257,42 @@ std::vector<std::string> AIService::recognizeTextBatch(const cv::Mat& image,
     const char* input_names[] = {rec_input_name_.c_str()};
     const char* output_names[] = {rec_output_name_.c_str()};
 
-    auto output_tensors = rec_session_->Run(Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, 1);
+    auto output_tensors = rec_session_->Run(
+        Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, 1
+    );
 
     float* output_data = output_tensors[0].GetTensorMutableData<float>();
     auto output_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
 
-    // Paso final: decodificar cada resultado a texto
-    std::vector<std::string> results;
     int time_steps = static_cast<int>(output_shape[1]);
     int num_classes = static_cast<int>(output_shape[2]);
 
-    for (int b = 0; b < batch_size; ++b) {
-        float* single_data = output_data + b * time_steps * num_classes;
-        std::vector<int64_t> shape = {1, time_steps, num_classes};
-        std::string decoded = decodeRecognitionOutput(single_data, shape);
-        results.push_back(decoded);
+    std::vector<std::string> results(batch_size);
+
+    // === Paralel decoding ===
+    int decode_threads = std::min<int>(std::thread::hardware_concurrency(), std::thread::hardware_concurrency());
+    int step = (batch_size + decode_threads - 1) / decode_threads;
+
+    std::vector<std::future<void>> futures;
+    for (int t = 0; t < decode_threads; ++t) {
+        int start = t * step;
+        int end = std::min(start + step, batch_size);
+        if (start >= end) break;
+
+        futures.emplace_back(std::async(std::launch::async, [&, start, end]() {
+            for (int b = start; b < end; ++b) {
+                float* single_data = output_data + b * time_steps * num_classes;
+                std::vector<int64_t> shape = {1, time_steps, num_classes};
+                results[b] = decodeRecognitionOutput(single_data, shape);
+            }
+        }));
     }
+
+    for (auto& fut : futures) fut.get();
 
     return results;
 }
+
 
 
 rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char* image_data,
@@ -287,7 +302,7 @@ rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char*
     try {
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        // 1. Decodificar imagen
+        // 1. Decode Image
         std::vector<uchar> image_buffer(image_data, image_data + data_size);
         cv::Mat img = cv::imdecode(image_buffer, cv::IMREAD_COLOR);
         if (img.empty()) {
@@ -309,7 +324,6 @@ rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char*
         double detection_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
         std::cout << "[TIMER] Detección OCR: " << detection_ms << " ms" << std::endl;
 
-// === RECONOCIMIENTO OCR (batch paralelizado) ===
         auto t4 = std::chrono::high_resolution_clock::now();
 
         std::vector<std::vector<cv::Point2f>> all_corners;
@@ -348,11 +362,11 @@ rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char*
 
 
 
-        // 3. Extraer texto estructurado
+        // Extract sorted data from OCR results
         std::string ocr_text = extractSortedByXYCoordinatesData(boxes, img.cols, img.rows);
         std::cout << "ocr text: " << ocr_text << std::endl;
 
-        // 4. Crear JSON de salida
+        // 4. Create Output JSON
         rapidjson::Document json;
         json.SetObject();
         rapidjson::Document::AllocatorType& allocator = json.GetAllocator();
@@ -367,18 +381,13 @@ rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char*
             "installation_type"
         };
 
-        // Inicializa todos los campos como null
-        for (const auto& field : schema_fields) {
-            json.AddMember(rapidjson::Value(field.c_str(), allocator), rapidjson::Value().SetNull(), allocator);
-        }
-
         std::string model_code = extractModelCode(ocr_text);
-        if (!model_code.empty()) {
-            json["model_code"].SetString(model_code.c_str(), allocator);
-        }
+        bool use_model = false;
+        float best_sim = 0.0f;
+        float p_hat = 0.0f;
+        int best_idx = -1;
+        rapidjson::Value status;
 
-        std::cout << "Model code extracted: " << model_code << std::endl;
-        // 5. Inferencia ONNX si hay model_code
         if (!model_code.empty()) {
             std::vector<int64_t> input_vec = encodeText(model_code);
             std::vector<int64_t> input_shape{1, static_cast<int64_t>(input_vec.size())};
@@ -412,8 +421,6 @@ rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char*
                 return probs[a] > probs[b];
             });
 
-            float best_sim = 0.0f;
-            int best_idx = -1;
             std::string norm = normalizeText(model_code);
             for (int k = 0; k < std::min(TOP_K, num_classes); ++k) {
                 int idx = top_indices[k];
@@ -427,40 +434,42 @@ rapidjson::Document AIService::extractTextAndStructuredData(const unsigned char*
 
             float SIM_TH = 0.75f;
             float PROB_TH = 0.5f;
-            float p_hat = (best_idx >= 0) ? probs[best_idx] : 0.0f;
+            p_hat = (best_idx >= 0) ? probs[best_idx] : 0.0f;
 
-            if (best_sim < SIM_TH || p_hat < PROB_TH) {
-                json.AddMember("status", "low_confidence", allocator);
-                json.AddMember("similarity", best_sim, allocator);
-                json.AddMember("confidence", p_hat, allocator);
-
-                auto extracted = extractHVACFieldsFromOCR(ocr_text);
-                for (const auto& field : schema_fields) {
-                    if (extracted.count(field)) {
-                        json[field.c_str()].SetString(extracted[field].c_str(), allocator);
-                    }
-                }
+            if (best_sim >= SIM_TH && p_hat >= PROB_TH) {
+                use_model = true;
+                status.SetString("ok", allocator);
             } else {
-                if (spec_lookup_.IsObject() && spec_lookup_.HasMember(idx2model_[best_idx].c_str())) {
-                    const rapidjson::Value& spec = spec_lookup_[idx2model_[best_idx].c_str()];
-                    for (auto it = spec.MemberBegin(); it != spec.MemberEnd(); ++it) {
-                        rapidjson::Value key(it->name, allocator);
-                        rapidjson::Value val(it->value, allocator);
-                        json.AddMember(key, val, allocator);
-                    }
-                }
-                json.AddMember("similarity", best_sim, allocator);
-                json.AddMember("confidence", p_hat, allocator);
-                json.AddMember("status", "ok", allocator);
+                status.SetString("low_confidence", allocator);
             }
         } else {
-            json.AddMember("status", "no_model_code", allocator);
+            status.SetString("no_model_code", allocator);
+        }
+
+        if (use_model && best_idx >= 0 && spec_lookup_.IsObject() && spec_lookup_.HasMember(idx2model_[best_idx].c_str())) {
+            json.SetObject();
+            const rapidjson::Value& spec = spec_lookup_[idx2model_[best_idx].c_str()];
+            for (auto it = spec.MemberBegin(); it != spec.MemberEnd(); ++it) {
+                rapidjson::Value key(it->name, allocator);
+                rapidjson::Value val(it->value, allocator);
+                json.AddMember(key, val, allocator);
+            }
+            json.AddMember("similarity", best_sim, allocator);
+            json.AddMember("confidence", p_hat, allocator);
+            json.AddMember("status", status, allocator);
+        } else {
+            json.SetObject();
             auto extracted = extractHVACFieldsFromOCR(ocr_text);
             for (const auto& field : schema_fields) {
                 if (extracted.count(field)) {
-                    json[field.c_str()].SetString(extracted[field].c_str(), allocator);
+                    json.AddMember(rapidjson::Value(field.c_str(), allocator), rapidjson::Value(extracted[field].c_str(), allocator), allocator);
+                } else {
+                    json.AddMember(rapidjson::Value(field.c_str(), allocator), rapidjson::Value().SetNull(), allocator);
                 }
             }
+            json.AddMember("similarity", best_sim, allocator);
+            json.AddMember("confidence", p_hat, allocator);
+            json.AddMember("status", status, allocator);
         }
 
         return json;
@@ -479,16 +488,14 @@ std::string AIService::extractModelCode(const std::string& text) {
     std::smatch match;
     std::string best_candidate;
 
-    // Paso 1: Buscar "MODEL NAME" con separación
     std::regex model_tag_rgx(
         R"((?:MODEL(?:\s*NAME)?)[\s:!\/\-]+([A-Z]{2,}[A-Z0-9\-\/]{4,}))",
         std::regex::icase
     );
     if (std::regex_search(text, match, model_tag_rgx)) {
-        return match.str(1);  // ¡devuélvelo directamente si es confiable y bien separado!
+        return match.str(1); 
     }
 
-    // Paso 2: Intentar con modelo pegado ("MODELAM100...")
     std::regex embedded_rgx(R"(MODEL(?:\s*NAME)?([A-Z]{2,}[A-Z0-9\-\/]{4,}))", std::regex::icase);
     if (std::regex_search(text, match, embedded_rgx)) {
         std::string full = match.str(0);
@@ -496,7 +503,6 @@ std::string AIService::extractModelCode(const std::string& text) {
         return std::regex_replace(full, strip_rgx, "");
     }
 
-    // Paso 3: Último recurso: buscar candidatos similares
     std::regex alt_rgx(R"([A-Z]{2,}[A-Z0-9\-\/]{4,})", std::regex::icase);
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), alt_rgx);
     auto words_end = std::sregex_iterator();
@@ -507,7 +513,6 @@ std::string AIService::extractModelCode(const std::string& text) {
         std::string lower = candidate;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
-        // Saltar si parece serial number u otros campos
         if (lower.find("sn") == 0 || lower.find("s/n") == 0 || 
             lower.find("ipx") == 0 || lower.find("kg") != std::string::npos ||
             lower.find("made") != std::string::npos) continue;
@@ -632,13 +637,13 @@ rapidjson::Document AIService::cleanJson(const std::string& raw) const
 
 
 std::vector<int64_t> AIService::encodeText(const std::string& text) {
-    std::vector<int64_t> encoded(MAX_LEN, 0); // Initialize with padding
+    std::vector<int64_t> encoded(MAX_LEN, 0);
     
     int len = std::min(static_cast<int>(text.length()), MAX_LEN);
     for (int i = 0; i < len; ++i) {
         std::string char_str(1, text[i]);
         auto it = vocab_.find(char_str);
-        encoded[i] = (it != vocab_.end()) ? it->second : 0; // 0 for unknown chars
+        encoded[i] = (it != vocab_.end()) ? it->second : 0;
     }
     
     return encoded;
@@ -690,8 +695,8 @@ std::vector<TextBox> AIService::detectTextBoxes(const cv::Mat& image) {
         std::cout << "Input image: " << image.cols << "x" << image.rows << " channels: " << image.channels() << std::endl;
         
         // Save original image for debugging
-        std::string original_debug_filename = "debug_original_input.png";
-        cv::imwrite(original_debug_filename, image);
+        // std::string original_debug_filename = "debug_original_input.png";
+        // cv::imwrite(original_debug_filename, image);
         
         // Preprocess image for detection
         cv::Mat preprocessed = preprocessImageForDetection(image);
@@ -699,8 +704,8 @@ std::vector<TextBox> AIService::detectTextBoxes(const cv::Mat& image) {
         // Save preprocessed image for debugging (correct denormalization)
         cv::Mat preprocessed_debug;
         preprocessed.convertTo(preprocessed_debug, CV_8U, 255.0, 0.0); // Convert [0,1] back to [0,255]
-        std::string preprocessed_debug_filename = "debug_preprocessed_input.png";
-        cv::imwrite(preprocessed_debug_filename, preprocessed_debug);
+        // std::string preprocessed_debug_filename = "debug_preprocessed_input.png";
+        // cv::imwrite(preprocessed_debug_filename, preprocessed_debug);
         
         // Create input tensor with actual processed image dimensions
         int actual_height = preprocessed.rows;
@@ -816,8 +821,8 @@ std::vector<TextBox> AIService::detectTextBoxes(const cv::Mat& image) {
         // Save detection map for debugging
         cv::Mat detection_map_vis;
         cv::normalize(detection_map, detection_map_vis, 0, 255, cv::NORM_MINMAX, CV_8U);
-        std::string detection_map_filename = "debug_detection_map.png";
-        cv::imwrite(detection_map_filename, detection_map_vis);
+        // std::string detection_map_filename = "debug_detection_map.png";
+        // cv::imwrite(detection_map_filename, detection_map_vis);
         
         cv::Mat binary_map;
         cv::threshold(detection_map, binary_map, final_threshold, 1.0, cv::THRESH_BINARY);
@@ -828,8 +833,8 @@ std::vector<TextBox> AIService::detectTextBoxes(const cv::Mat& image) {
         // Save binary map for debugging
         cv::Mat binary_map_vis;
         binary_map.convertTo(binary_map_vis, CV_8U, 255);
-        std::string binary_map_filename = "debug_binary_map.png";
-        cv::imwrite(binary_map_filename, binary_map_vis);
+        // std::string binary_map_filename = "debug_binary_map.png";
+        // cv::imwrite(binary_map_filename, binary_map_vis);
         
         // Convert to 8-bit for contour detection
         cv::Mat binary_8u;
@@ -845,8 +850,8 @@ std::vector<TextBox> AIService::detectTextBoxes(const cv::Mat& image) {
         cv::dilate(morphed, dilated, kernel, cv::Point(-1, -1), 2);
         
         // Save morphed binary map for debugging
-        std::string morphed_filename = "debug_morphed_map.png";
-        cv::imwrite(morphed_filename, dilated);
+        // std::string morphed_filename = "debug_morphed_map.png";
+        // cv::imwrite(morphed_filename, dilated);
         
         // Find contours on the morphed image
         std::vector<std::vector<cv::Point>> contours;
@@ -1078,7 +1083,6 @@ cv::Mat AIService::preprocessImageForDetection(const cv::Mat& image) {
         cv::cvtColor(processed, yuv, cv::COLOR_BGR2YUV);
         std::vector<cv::Mat> yuv_channels;
         cv::split(yuv, yuv_channels);
-            // --- Aquí aplicas CLAHE en el canal Y (luminosidad) ---
         cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(/*clipLimit=*/2.0, /*tileGridSize=*/cv::Size(8,8));
         clahe->apply(yuv_channels[0], yuv_channels[0]);
         cv::merge(yuv_channels, yuv);
@@ -1087,55 +1091,52 @@ cv::Mat AIService::preprocessImageForDetection(const cv::Mat& image) {
         // For grayscale images, directly equalize
         cv::equalizeHist(processed, equalized);
     }
-        // 1. Filtro bilateral para suavizar sin perder bordes
     cv::Mat bilat;
     cv::bilateralFilter(equalized, bilat, /*d=*/9, /*sigmaColor=*/75, /*sigmaSpace=*/75);
     // 2. Unsharp mask para realzar bordes del texto
     cv::Mat gauss, sharp;
     cv::GaussianBlur(bilat, gauss, cv::Size(0,0), /*sigma=*/3);
     cv::addWeighted(bilat, 1.5, gauss, -0.5, 0, sharp);
-    // 3. Top-hat para resaltar trazos claros sobre fondo más oscuro
     cv::Mat tophat;
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(15,15));
     cv::morphologyEx(sharp, tophat, cv::MORPH_TOPHAT, kernel);
 
-// 4. Corrección gamma (ajusta gamma<1 para aclarar)
-cv::Mat f;
-tophat.convertTo(f, CV_32F, 1.0/255);
-cv::pow(f, /*gamma=*/0.6, f);
-f.convertTo(tophat, CV_8U, 255);
+    cv::Mat f;
+    tophat.convertTo(f, CV_32F, 1.0/255);
+    cv::pow(f, /*gamma=*/0.6, f);
+    f.convertTo(tophat, CV_8U, 255);
 
-cv::Mat binInput;
-if (tophat.channels() == 3) {
-    // pasa a gris
-    cv::cvtColor(tophat, binInput, cv::COLOR_BGR2GRAY);
-} else {
-    binInput = tophat;  // ya es mono
-}
-// asegura 8-bits
-if (binInput.type() != CV_8UC1) {
-    binInput.convertTo(binInput, CV_8U, 255.0);
-}
+    cv::Mat binInput;
+    if (tophat.channels() == 3) {
+        // pasa a gris
+        cv::cvtColor(tophat, binInput, cv::COLOR_BGR2GRAY);
+    } else {
+        binInput = tophat;  // ya es mono
+    }
+    //  8-bits
+    if (binInput.type() != CV_8UC1) {
+        binInput.convertTo(binInput, CV_8U, 255.0);
+    }
 
-// 5. Umbralización adaptativa (ya con CV_8UC1)
-cv::Mat bin;
-cv::adaptiveThreshold(
-    binInput, bin, 255,
-    cv::ADAPTIVE_THRESH_GAUSSIAN_C,
-    cv::THRESH_BINARY_INV,
-    /*blockSize=*/15, /*C=*/2
-);
+    // 5. Adative thresholding
+    cv::Mat bin;
+    cv::adaptiveThreshold(
+        binInput, bin, 255,
+        cv::ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv::THRESH_BINARY_INV,
+        /*blockSize=*/15, /*C=*/2
+    );
 
-// 6. Morfología de cierre y apertura para limpiar artefactos
-cv::Mat m;
-cv::morphologyEx(bin, m, cv::MORPH_CLOSE,
-                 cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3,3)));
-cv::morphologyEx(m, m, cv::MORPH_OPEN,
-                 cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3,3)));
+    // 6. Morphological operations to clean up noise
+    cv::Mat m;
+    cv::morphologyEx(bin, m, cv::MORPH_CLOSE,
+                    cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3,3)));
+    cv::morphologyEx(m, m, cv::MORPH_OPEN,
+                    cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3,3)));
 
     // Save equalized image for debugging
-    std::string equalized_debug_filename = "debug_equalized_resized.png";
-    cv::imwrite(equalized_debug_filename, equalized);
+    // std::string equalized_debug_filename = "debug_equalized_resized.png";
+    // cv::imwrite(equalized_debug_filename, equalized);
     
     processed = equalized;
     
@@ -1472,12 +1473,10 @@ std::vector<cv::Point2f> AIService::orderCorners(const std::vector<cv::Point2f>&
 std::string AIService::extractSortedByXYCoordinatesData(const std::vector<TextBox>& boxes, int image_width, int image_height) {
     if (boxes.empty()) return "";
 
-    // Ordenar boxes por posición Y (de arriba a abajo), luego X (izquierda a derecha)
     std::vector<TextBox> sorted_boxes = sortBoxesByPosition(boxes);
 
-    // Agrupar por líneas (boxes con centro Y cercano)
     std::vector<std::vector<const TextBox*>> lines;
-    const float line_threshold = 30.0f; // píxeles de tolerancia para considerar la misma línea
+    const float line_threshold = 30.0f;
 
     for (const auto& box : sorted_boxes) {
         cv::Point2f center = getBoxCenter(box.corners);
@@ -1495,10 +1494,8 @@ std::string AIService::extractSortedByXYCoordinatesData(const std::vector<TextBo
         }
     }
 
-    // Construir el texto final respetando el layout
     std::string result;
     for (const auto& line : lines) {
-        // Ordenar cada línea por X
         std::vector<const TextBox*> line_sorted = line;
         std::sort(line_sorted.begin(), line_sorted.end(), [this](const TextBox* a, const TextBox* b) {
             return getBoxCenter(a->corners).x < getBoxCenter(b->corners).x;
@@ -1544,8 +1541,6 @@ bool AIService::isSerialNumber(const std::string& text) {
     
     return false;
 }
-
-
 
 cv::Point2f AIService::getBoxCenter(const std::vector<cv::Point2f>& corners) {
     cv::Point2f center(0, 0);
